@@ -1,0 +1,223 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+#
+# Copyright (C) 2015, Netzkommune GmbH, Filias Heidt <post@filias.name>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+DOCUMENTATION = '''
+---
+module: pureftpd_user
+short_description: Adds, removes or modifies a pure-ftpd user
+description:
+   - Adds, removes or modifies a pure-ftpd user
+options:
+  name:
+    description:
+      - name of the user to add or remove
+    required: true
+    default: null
+  password:
+    description:
+      - set the user's password
+    required: true
+    default: null
+  unix_user:
+    description:
+      - Which system user should the ftp-user be mapped to
+    required: false
+    default: None
+  unix_group:
+    description:
+      - Which system group should the user be mapped to
+    required: false
+    default: None
+  state:
+    description:
+      - Whether the user should exist.  When C(absent), removes
+        the user.
+    required: false
+    default: present
+    choices: [ "present", "absent" ]
+notes:
+   - Requires Pure-FTPd and the C(pure-pw) util on the target host
+   - If executed as root or with sudo, set C(unix_user) and C(unix_group), because mapping to root is forbidden.
+author: Filias Heidt
+'''
+
+EXAMPLES = """
+# Create pureftp User alice with password 12345, mapped to unix user/group www and homedir /var/www/
+- pureftpd_user: name=alice password=12345 unix_user=www unix_group=www homedir=/var/www
+"""
+
+import syslog
+
+class PureFTPdUser(object):
+    """
+    Generic PureFTPd User manipulation class.
+    """
+
+    def __init__(self, module):
+        self.module = module
+        self.state = module.params['state']
+        self.name = module.params['name']
+        self.password = module.params['password']
+        self.unix_user = module.params['unix_user']
+        self.unix_group = module.params['unix_group']
+        self.homedir = module.params['homedir']
+
+    def execute_command(self, cmd, use_unsafe_shell=False, data=None):
+        # Always append -m to update the Database
+        cmd.append('-m')
+
+        syslog.openlog('ansible-%s' % os.path.basename(__file__))
+        syslog.syslog(syslog.LOG_NOTICE, 'Command %s' % '|'.join(cmd))
+
+        return self.module.run_command(cmd, use_unsafe_shell=use_unsafe_shell,
+                                       data=data)
+
+    def create_user(self):
+        cmd = [self.module.get_bin_path('pure-pw', True)]
+        cmd.append('useradd')
+        cmd.append(self.name)
+        if not self.password:
+            self.module.fail_json(msg="No Password for new user specified!")
+
+        data = "%s\n%s" % (self.password, self.password)
+        if self.unix_user:
+            cmd.append('-u')
+            cmd.append(self.unix_user)
+        if self.unix_group:
+            cmd.append('-g')
+            cmd.append(self.unix_group)
+        if self.homedir:
+            cmd.append('-d')
+            cmd.append(self.homedir)
+
+        return self.execute_command(cmd, data=data)
+
+    def remove_user(self):
+        cmd = [self.module.get_bin_path('pure-pw', True)]
+        cmd.append('userdel')
+        cmd.append(self.name)
+
+        return self.execute_command(cmd)
+
+    def modify_user(self):
+        cmd = [self.module.get_bin_path('pure-pw', True)]
+        cmd.append('usermod')
+        cmd.append(self.name)
+        if self.unix_user:
+            cmd.append('-u')
+            cmd.append(self.unix_user)
+        if self.unix_group:
+            cmd.append('-g')
+            cmd.append(self.unix_group)
+        if self.homedir:
+            cmd.append('-d')
+            cmd.append(self.homedir)
+
+        return self.execute_command(cmd)
+
+
+    def user_exists(self):
+        cmd = [self.module.get_bin_path('pure-pw', True)]
+        cmd.append('show')
+        cmd.append(self.name)
+        (rc, out, err) = self.execute_command(cmd)
+        return True if rc == 0 else False
+
+    def must_change(self):
+        # see if I have to change or add the user - for the --check thingy
+        cmd = [self.module.get_bin_path('pure-pw', True)]
+        cmd.append('show')
+        cmd.append(self.name)
+        (rc, out, err) = self.execute_command(cmd)
+
+        lines = out.split('\n')
+        for line in lines:
+            if len(line.split(':')) < 2:
+                continue
+            k = line.split(':')[0]
+            v = line.split(':')[1]
+            if self.unix_user and "UID" in k:
+                if not self.unix_user in v:
+                    return True
+            if self.unix_group and "GID" in k:
+                if not self.unix_group in v:
+                    return True
+            # TODO: Possible Bug if homedir gets changed to a subdirectory of
+            # the old homedir
+            if self.homedir and "Directory" in k:
+                if not self.homedir in v:
+                    return True
+        return False
+
+# =============================
+
+def main():
+    module = AnsibleModule(
+        argument_spec = dict(
+            state=dict(default='present', choices=['present', 'absent'], type='str'),
+            name=dict(required=True, aliases=['user'], type='str'),
+            password=dict(required=True, type='str'),
+            unix_user=dict(default=None, type='str'),
+            unix_group=dict(default=None, type='str'),
+            homedir=dict(required=True, default=None, type='str'),
+        ),
+        supports_check_mode=True,
+    )
+
+    user = PureFTPdUser(module)
+    rc = None
+    out = ''
+    err = ''
+    result = {}
+    result['name'] = user.name
+    result['state'] = user.state
+    result['homedir'] = user.homedir
+    result['unix_user'] = user.unix_user
+    result['unix_group'] = user.unix_group
+    result['changed'] = False
+
+    if user.state == 'absent':
+        if user.user_exists():
+            if module.check_mode:
+                module.exit_json(changed=True)
+            (rc, out, err) = user.remove_user()
+            result['changed'] = True
+            if rc != 0:
+                module.fail_json(name=user.name, msg=err, rc=rc)
+
+    elif user.state == 'present':
+        if not user.user_exists():
+            if module.check_mode:
+                module.exit_json(changed=True)
+            (rc, out, err) = user.create_user()
+            result['changed'] = True
+        else:
+            if user.must_change():
+                if module.check_mode:
+                    module.exit_json(changed=True)
+                (rc, out, err) = user.modify_user()
+                result['changed'] = True
+
+        if rc is not None and rc != 0:
+            module.fail_json(name=user.name, msg=err, rc=rc)
+
+    module.exit_json(**result)
+
+from ansible.module_utils.basic import *
+main()
